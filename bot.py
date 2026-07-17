@@ -15,6 +15,7 @@ import statistics
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -102,6 +103,20 @@ def init_db():
             thread_id INTEGER
         )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS geocode_cache (
+            query TEXT PRIMARY KEY,
+            lat REAL,
+            lon REAL
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS price_history (
+            listing_id TEXT,
+            price INTEGER,
+            observed_at TEXT
+        )"""
+    )
     try:
         conn.execute("ALTER TABLE seen ADD COLUMN last_price INTEGER")
     except sqlite3.OperationalError:
@@ -114,10 +129,62 @@ def init_db():
     return conn
 
 
+def log_price_history(conn, listing_id, price):
+    if price is None:
+        return
+    row = conn.execute(
+        "SELECT price FROM price_history WHERE listing_id = ? ORDER BY observed_at DESC LIMIT 1",
+        (listing_id,),
+    ).fetchone()
+    if row and row[0] == price:
+        return  # fiyat değişmediyse tekrar tekrar aynı satırı eklemeye gerek yok
+    conn.execute(
+        "INSERT INTO price_history (listing_id, price, observed_at) VALUES (?, ?, ?)",
+        (listing_id, price, time.strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    conn.commit()
+
+
 def fetch(url):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=20) as resp:
         return resp.read().decode("utf-8", errors="replace")
+
+
+GEOCODE_USER_AGENT = "KoyEviBot/1.0 (kişisel emlak takip botu; github.com/metehankutlay/koy-evi-bot)"
+
+
+def geocode(conn, query):
+    """OpenStreetMap Nominatim ile bir adres metnini (lat, lon) çevirir, sonucu
+    geocode_cache'te saklar. Nominatim kullanım politikası saniyede 1 istekle
+    sınırlı olduğu için sadece önbellekte OLMAYAN sorgular için gerçek istek atılır,
+    her yeni istekten sonra 1.1sn beklenir."""
+    row = conn.execute(
+        "SELECT lat, lon FROM geocode_cache WHERE query = ?", (query,)
+    ).fetchone()
+    if row:
+        return row[0], row[1]
+
+    url = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode(
+        {"q": query, "format": "json", "limit": 1, "countrycodes": "tr"}
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": GEOCODE_USER_AGENT})
+    lat, lon = None, None
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        if data:
+            lat, lon = float(data[0]["lat"]), float(data[0]["lon"])
+    except Exception as e:
+        log(f"Geocode hatası ({query}): {e}")
+
+    conn.execute(
+        "INSERT OR REPLACE INTO geocode_cache (query, lat, lon) VALUES (?, ?, ?)",
+        (query, lat, lon),
+    )
+    conn.commit()
+    time.sleep(1.1)  # Nominatim kullanım politikası: en fazla 1 istek/saniye
+    return lat, lon
 
 
 def parse_listings(html):
@@ -544,83 +611,388 @@ def _html_escape(text):
     )
 
 
-def generate_dashboard(matches):
-    """matches listesinden ilçe+kategori bazlı özet ve fırsat listesi içeren
-    statik bir dashboard.html üretir."""
-    groups = {}
+def generate_dashboard(conn, matches):
+    """matches listesinden etkileşimli bir dashboard.html üretir: mahalle bazlı harita
+    (OSM Nominatim ile geocode edilmiş), sıralanabilir/filtrelenebilir ilan listesi,
+    ilçe+kategori bazlı m² dağılımı ve fiyat geçmişi. Tüm etkileşim istemci tarafında
+    (gömülü JSON + vanilla JS) çalışır, sunucu/backend gerekmez."""
+
+    # 1) Mahalle bazlı geocoding + istatistik (harita için)
+    mahalle_groups = {}
+    for l in matches:
+        loc = l.get("location") or district_of(l)
+        mahalle_groups.setdefault(loc, []).append(l)
+
+    mahalle_points = []
+    for loc, listings in mahalle_groups.items():
+        query = f"{loc}, {province_of(listings[0])}, Türkiye"
+        lat, lon = geocode(conn, query)
+        if lat is None:
+            continue
+        ppm_values = [l["price_per_m2"] for l in listings if l.get("price_per_m2")]
+        mahalle_points.append(
+            {
+                "name": loc,
+                "district": district_of(listings[0]),
+                "lat": lat,
+                "lon": lon,
+                "count": len(listings),
+                "medianPpm": round(statistics.median(ppm_values)) if ppm_values else None,
+            }
+        )
+
+    # 2) İlçe+kategori bazlı m² dağılımı (nadir büyüklük tespiti + histogram için)
+    district_groups = {}
     for l in matches:
         key = (district_of(l), l["category"])
-        groups.setdefault(key, []).append(l)
+        district_groups.setdefault(key, []).append(l)
 
-    district_rows = []
-    for (district, category), listings in sorted(groups.items()):
+    district_stats = {}
+    for (district, category), listings in district_groups.items():
+        m2_values = sorted(v for v in (parse_m2_value(l) for l in listings) if v)
         ppm_values = [l["price_per_m2"] for l in listings if l.get("price_per_m2")]
-        med = statistics.median(ppm_values) if ppm_values else None
-        med_str = f"{med:,.0f} TL/m²".replace(",", ".") if med else "—"
-        district_rows.append(
-            f"<tr><td>{_html_escape(district)}</td>"
-            f"<td>{_html_escape(CATEGORY_LABELS.get(category, category))}</td>"
-            f"<td>{len(listings)}</td><td>{med_str}</td></tr>"
+        district_stats[f"{district}|{category}"] = {
+            "district": district,
+            "category": category,
+            "categoryLabel": CATEGORY_LABELS.get(category, category),
+            "count": len(listings),
+            "medianPpm": round(statistics.median(ppm_values)) if ppm_values else None,
+            "medianM2": round(statistics.median(m2_values)) if m2_values else None,
+            "m2Values": m2_values,
+        }
+
+    # 3) Her ilan için detay + fiyat geçmişi
+    listing_data = []
+    for l in matches:
+        history = conn.execute(
+            "SELECT price, observed_at FROM price_history WHERE listing_id = ? ORDER BY observed_at",
+            (l["id"],),
+        ).fetchall()
+        stat_key = f"{district_of(l)}|{l['category']}"
+        med_m2 = district_stats.get(stat_key, {}).get("medianM2")
+        m2_val = parse_m2_value(l)
+        rare_size = bool(
+            med_m2 and m2_val and (m2_val > med_m2 * 2 or m2_val < med_m2 * 0.5)
+        )
+        listing_data.append(
+            {
+                "id": l["id"],
+                "name": l["name"],
+                "url": l["url"],
+                "price": l["price"],
+                "m2": m2_val,
+                "ppm": round(l["price_per_m2"]) if l.get("price_per_m2") else None,
+                "category": l["category"],
+                "categoryLabel": CATEGORY_LABELS.get(l["category"], l["category"]),
+                "district": district_of(l),
+                "province": province_of(l),
+                "location": l.get("location", ""),
+                "isSahibinden": bool(l.get("is_sahibinden")),
+                "score": l.get("investment_score", 0),
+                "scoreNotes": l.get("investment_score_notes", []),
+                "dealNote": l.get("deal_note"),
+                "datePosted": l.get("date_posted"),
+                "rareSize": rare_size,
+                "history": [{"price": p, "date": d} for p, d in history],
+            }
         )
 
     deal_count = sum(1 for l in matches if l.get("deal_note"))
-    top_scored = sorted(matches, key=lambda l: l.get("investment_score", 0), reverse=True)[:30]
+    top_score = max((l.get("investment_score", 0) for l in matches), default=0)
+    districts = sorted({l["district"] for l in listing_data})
 
-    def listing_card(l):
-        price_str = f"{l['price']:,.0f} TL".replace(",", ".") if l["price"] else "—"
-        ppm_str = f"{l['price_per_m2']:,.0f} TL/m²".replace(",", ".") if l.get("price_per_m2") else "—"
-        owner = "👤 Sahibinden" if l.get("is_sahibinden") else "🏢 Emlak Ofisinden"
-        deal = f'<div class="deal">{_html_escape(l["deal_note"])}</div>' if l.get("deal_note") else ""
-        score = l.get("investment_score")
-        score_badge = f'<div class="score">🤖 {score}/100</div>' if score is not None else ""
-        return f"""
-        <a class="card" href="{_html_escape(l['url'])}" target="_blank" rel="noopener">
-          {score_badge}
-          <div class="card-title">{_html_escape(l['name'])}</div>
-          <div class="card-meta">{_html_escape(district_of(l))} · {_html_escape(CATEGORY_LABELS.get(l['category'], l['category']))} · {owner}</div>
-          <div class="card-price">{price_str} <span class="ppm">({ppm_str})</span></div>
-          {deal}
-        </a>"""
-
-    deal_cards = "\n".join(listing_card(l) for l in top_scored) or "<p>Şu an hiç ilan yok.</p>"
+    listings_json = json.dumps(listing_data, ensure_ascii=False)
+    mahalle_json = json.dumps(mahalle_points, ensure_ascii=False)
+    district_stats_json = json.dumps(list(district_stats.values()), ensure_ascii=False)
+    districts_json = json.dumps(districts, ensure_ascii=False)
+    category_labels_json = json.dumps(CATEGORY_LABELS, ensure_ascii=False)
 
     html = f"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <title>KöyEviBot Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-  :root {{ color-scheme: light dark; }}
-  body {{ font-family: -apple-system, system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }}
+  :root {{ color-scheme: light dark; --accent: #f60; --deal: #d9480f; --score: #7048e8; }}
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: -apple-system, system-ui, sans-serif; max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }}
   h1 {{ font-size: 1.4rem; }}
   h2 {{ font-size: 1.1rem; margin-top: 2rem; border-bottom: 1px solid #8884; padding-bottom: .3rem; }}
   table {{ width: 100%; border-collapse: collapse; font-size: .9rem; }}
-  th, td {{ text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #8883; }}
-  .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: .8rem; }}
-  .card {{ display: block; border: 1px solid #8884; border-radius: .6rem; padding: .8rem; text-decoration: none; color: inherit; }}
-  .card:hover {{ border-color: #f60; }}
-  .card-title {{ font-weight: 600; margin-bottom: .3rem; }}
-  .card-meta {{ font-size: .8rem; opacity: .7; margin-bottom: .4rem; }}
-  .card-price {{ font-weight: 600; }}
-  .ppm {{ font-weight: 400; opacity: .7; font-size: .85rem; }}
-  .deal {{ margin-top: .4rem; color: #d9480f; font-weight: 600; font-size: .85rem; }}
-  .score {{ display: inline-block; margin-bottom: .3rem; font-size: .8rem; font-weight: 700; color: #7048e8; }}
+  th, td {{ text-align: left; padding: .5rem .6rem; border-bottom: 1px solid #8883; vertical-align: top; }}
+  th {{ cursor: pointer; user-select: none; white-space: nowrap; }}
+  th:hover {{ color: var(--accent); }}
+  tr.district-row {{ cursor: pointer; }}
+  tr.district-row:hover {{ background: #8881; }}
+  tr.listing-row {{ cursor: pointer; }}
+  tr.listing-row:hover {{ background: #8881; }}
+  tr.detail-row td {{ background: #8880a; padding: 1rem; }}
   .updated {{ opacity: .6; font-size: .85rem; }}
+  .badge {{ display: inline-block; padding: .15rem .55rem; border-radius: 1rem; font-size: .75rem; font-weight: 600; white-space: nowrap; }}
+  .badge-owner {{ background: #2f9e44; color: #fff; }}
+  .badge-agency {{ background: #1971c2; color: #fff; }}
+  .badge-score {{ background: var(--score); color: #fff; }}
+  .badge-deal {{ background: var(--deal); color: #fff; }}
+  .badge-rare {{ background: #e8590c; color: #fff; }}
+  #map {{ height: 420px; border-radius: .6rem; margin-top: .6rem; }}
+  .filters {{ display: flex; flex-wrap: wrap; gap: .5rem; margin: .8rem 0; align-items: center; }}
+  .filters input, .filters select {{ padding: .4rem .6rem; border-radius: .4rem; border: 1px solid #8886; background: transparent; color: inherit; }}
+  .filters input[type=text] {{ flex: 1; min-width: 180px; }}
+  .stat-row {{ display: flex; gap: 1.5rem; flex-wrap: wrap; margin: .5rem 0 1rem; font-size: .9rem; opacity: .85; }}
+  .hist {{ display: flex; align-items: flex-end; gap: 2px; height: 60px; margin-top: .4rem; }}
+  .hist div {{ background: var(--accent); flex: 1; min-width: 4px; border-radius: 2px 2px 0 0; opacity: .8; }}
+  .link {{ color: var(--accent); text-decoration: none; }}
+  .link:hover {{ text-decoration: underline; }}
+  .name-cell {{ max-width: 320px; }}
+  .clear-btn {{ background: transparent; border: 1px solid #8886; border-radius: .4rem; padding: .4rem .7rem; cursor: pointer; color: inherit; }}
 </style>
-<h1>🏡 KöyEviBot Dashboard</h1>
-<p class="updated">Son güncelleme: {time.strftime('%Y-%m-%d %H:%M:%S')} — {len(matches)} ilan, {deal_count} fırsat</p>
 
-<h2>🤖 AI Yatırım Puanına Göre En İyi 30 İlan (Beta)</h2>
-<div class="grid">
-{deal_cards}
+<h1>🏡 KöyEviBot Dashboard</h1>
+<p class="updated">Son güncelleme: {time.strftime('%Y-%m-%d %H:%M:%S')}</p>
+<div class="stat-row">
+  <span>📋 {len(matches)} ilan</span>
+  <span>🔥 {deal_count} fırsat</span>
+  <span>🤖 En yüksek puan: {top_score}/100</span>
+  <span>📍 {len(mahalle_points)} mahalle haritada</span>
 </div>
 
-<h2>📊 İlçe / Kategori Bazlı Medyan m² Fiyatları</h2>
+<h2>🗺️ Mahalle Bazlı m² Fiyat Haritası</h2>
+<div id="map"></div>
+
+<h2>📋 İlan Listesi</h2>
+<div class="filters">
+  <input type="text" id="f-search" placeholder="Başlıkta ara...">
+  <select id="f-district"><option value="">Tüm ilçeler</option></select>
+  <select id="f-category"><option value="">Tüm kategoriler</option></select>
+  <select id="f-owner">
+    <option value="">Sahibinden/Ofis (hepsi)</option>
+    <option value="1">👤 Sadece Sahibinden</option>
+    <option value="0">🏢 Sadece Emlak Ofisi</option>
+  </select>
+  <select id="f-sort">
+    <option value="score">🤖 AI Puanına göre sırala</option>
+    <option value="price">💰 Fiyata göre (artan)</option>
+    <option value="ppm">📊 m² fiyatına göre (artan)</option>
+    <option value="m2">📐 Alana göre (azalan)</option>
+  </select>
+  <button class="clear-btn" id="f-clear">Filtreleri Temizle</button>
+</div>
+<p id="result-count" style="opacity:.7; font-size:.85rem;"></p>
 <table>
-<tr><th>İlçe</th><th>Kategori</th><th>İlan Sayısı</th><th>Medyan m² Fiyatı</th></tr>
-{"".join(district_rows)}
+  <thead>
+    <tr>
+      <th>🤖</th><th>İlan</th><th>İlçe</th><th>Kategori</th><th>Tip</th>
+      <th>Fiyat</th><th>m²</th><th>m² Fiyatı</th>
+    </tr>
+  </thead>
+  <tbody id="listing-body"></tbody>
 </table>
+
+<h2>📊 İlçe / Kategori Bazlı Medyan m² Fiyatları ve Alan Dağılımı</h2>
+<p style="opacity:.7; font-size:.85rem;">Bir satıra tıklayınca o ilçe/kategorideki tüm ilanlar yukarıdaki listede filtrelenir.</p>
+<table>
+  <thead><tr><th>İlçe</th><th>Kategori</th><th>İlan Sayısı</th><th>Medyan m² Fiyatı</th><th>Medyan Alan</th><th>Alan Dağılımı</th></tr></thead>
+  <tbody id="district-body"></tbody>
+</table>
+
+<script>
+const LISTINGS = {listings_json};
+const MAHALLE_POINTS = {mahalle_json};
+const DISTRICT_STATS = {district_stats_json};
+const DISTRICTS = {districts_json};
+const CATEGORY_LABELS = {category_labels_json};
+
+function tl(n) {{
+  if (n === null || n === undefined) return '—';
+  return Math.round(n).toLocaleString('tr-TR') + ' TL';
+}}
+function ppmStr(n) {{
+  if (n === null || n === undefined) return '—';
+  return Math.round(n).toLocaleString('tr-TR') + ' TL/m²';
+}}
+
+// --- Filtre kontrollerini doldur ---
+const districtSelect = document.getElementById('f-district');
+DISTRICTS.forEach(d => {{
+  const opt = document.createElement('option');
+  opt.value = d; opt.textContent = d;
+  districtSelect.appendChild(opt);
+}});
+const categorySelect = document.getElementById('f-category');
+Object.entries(CATEGORY_LABELS).forEach(([key, label]) => {{
+  const opt = document.createElement('option');
+  opt.value = key; opt.textContent = label;
+  categorySelect.appendChild(opt);
+}});
+
+const state = {{ search: '', district: '', category: '', owner: '', sort: 'score', expanded: null }};
+
+function applyFilters() {{
+  let rows = LISTINGS.filter(l => {{
+    if (state.search && !l.name.toLowerCase().includes(state.search.toLowerCase())) return false;
+    if (state.district && l.district !== state.district) return false;
+    if (state.category && l.category !== state.category) return false;
+    if (state.owner === '1' && !l.isSahibinden) return false;
+    if (state.owner === '0' && l.isSahibinden) return false;
+    return true;
+  }});
+  rows.sort((a, b) => {{
+    if (state.sort === 'score') return (b.score||0) - (a.score||0);
+    if (state.sort === 'price') return (a.price||Infinity) - (b.price||Infinity);
+    if (state.sort === 'ppm') return (a.ppm||Infinity) - (b.ppm||Infinity);
+    if (state.sort === 'm2') return (b.m2||0) - (a.m2||0);
+    return 0;
+  }});
+  return rows;
+}}
+
+function historySparkline(history) {{
+  if (!history || history.length < 2) return '<p style="opacity:.6">Fiyat geçmişi henüz tek nokta, değişiklik yok.</p>';
+  const items = history.map(h => `${{h.date.split(' ')[0]}}: ${{tl(h.price)}}`).join(' → ');
+  return `<p><b>Fiyat geçmişi:</b> ${{items}}</p>`;
+}}
+
+function scoreNotesHtml(notes) {{
+  if (!notes || !notes.length) return '';
+  return '<ul style="margin:.3rem 0 0 1.1rem; padding:0;">' + notes.map(n => `<li>${{n}}</li>`).join('') + '</ul>';
+}}
+
+function renderList() {{
+  const rows = applyFilters();
+  document.getElementById('result-count').textContent = `${{rows.length}} ilan gösteriliyor (toplam ${{LISTINGS.length}})`;
+  const body = document.getElementById('listing-body');
+  body.innerHTML = '';
+  rows.forEach(l => {{
+    const tr = document.createElement('tr');
+    tr.className = 'listing-row';
+    const ownerBadge = l.isSahibinden
+      ? '<span class="badge badge-owner">👤 Sahibinden</span>'
+      : '<span class="badge badge-agency">🏢 Ofis</span>';
+    tr.innerHTML = `
+      <td><span class="badge badge-score">${{l.score}}</span></td>
+      <td class="name-cell">${{l.name}}${{l.dealNote ? '<br><span class="badge badge-deal" style="margin-top:.2rem">🔥 Fırsat</span>' : ''}}${{l.rareSize ? ' <span class="badge badge-rare">📏 Nadir m²</span>' : ''}}</td>
+      <td>${{l.district}}</td>
+      <td>${{l.categoryLabel}}</td>
+      <td>${{ownerBadge}}</td>
+      <td>${{tl(l.price)}}</td>
+      <td>${{l.m2 || '—'}}</td>
+      <td>${{ppmStr(l.ppm)}}</td>
+    `;
+    tr.addEventListener('click', () => {{
+      state.expanded = state.expanded === l.id ? null : l.id;
+      renderList();
+    }});
+    body.appendChild(tr);
+
+    if (state.expanded === l.id) {{
+      const detailTr = document.createElement('tr');
+      detailTr.className = 'detail-row';
+      detailTr.innerHTML = `<td colspan="8">
+        <p><a class="link" href="${{l.url}}" target="_blank" rel="noopener">İlana git ↗</a> · ${{l.location}}, ${{l.province}} · İlan tarihi: ${{l.datePosted || '—'}}</p>
+        ${{l.dealNote ? `<p>🔥 ${{l.dealNote}}</p>` : ''}}
+        <p><b>AI Yatırım Puanı: ${{l.score}}/100</b>${{scoreNotesHtml(l.scoreNotes)}}</p>
+        ${{historySparkline(l.history)}}
+      </td>`;
+      body.appendChild(detailTr);
+    }}
+  }});
+}}
+
+function histogramSvg(values) {{
+  if (!values || values.length < 3) return '<span style="opacity:.5">yetersiz veri</span>';
+  const min = values[0], max = values[values.length - 1];
+  if (min === max) return '<span style="opacity:.5">tek değer</span>';
+  const bins = 8;
+  const width = max - min;
+  const counts = new Array(bins).fill(0);
+  values.forEach(v => {{
+    let idx = Math.floor(((v - min) / width) * bins);
+    if (idx >= bins) idx = bins - 1;
+    counts[idx]++;
+  }});
+  const maxCount = Math.max(...counts);
+  const bars = counts.map(c => `<div style="height:${{Math.max(4, (c / maxCount) * 56)}}px" title="${{c}} ilan"></div>`).join('');
+  return `<div class="hist">${{bars}}</div><div style="font-size:.7rem; opacity:.6;">${{Math.round(min)}} m² – ${{Math.round(max)}} m²</div>`;
+}}
+
+function renderDistrictTable() {{
+  const body = document.getElementById('district-body');
+  body.innerHTML = '';
+  DISTRICT_STATS.sort((a, b) => a.district.localeCompare(b.district) || a.categoryLabel.localeCompare(b.categoryLabel));
+  DISTRICT_STATS.forEach(s => {{
+    const tr = document.createElement('tr');
+    tr.className = 'district-row';
+    tr.innerHTML = `
+      <td>${{s.district}}</td>
+      <td>${{s.categoryLabel}}</td>
+      <td>${{s.count}}</td>
+      <td>${{ppmStr(s.medianPpm)}}</td>
+      <td>${{s.medianM2 || '—'}} m²</td>
+      <td>${{histogramSvg(s.m2Values)}}</td>
+    `;
+    tr.addEventListener('click', () => {{
+      state.district = s.district;
+      state.category = s.category;
+      document.getElementById('f-district').value = s.district;
+      document.getElementById('f-category').value = s.category;
+      renderList();
+      document.getElementById('listing-body').scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+    }});
+    body.appendChild(tr);
+  }});
+}}
+
+// --- Harita ---
+if (MAHALLE_POINTS.length) {{
+  const map = L.map('map').setView([MAHALLE_POINTS[0].lat, MAHALLE_POINTS[0].lon], 9);
+  L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+    attribution: '© OpenStreetMap katkıda bulunanlar',
+  }}).addTo(map);
+  const ppmAll = MAHALLE_POINTS.map(p => p.medianPpm).filter(Boolean);
+  const maxPpm = Math.max(...ppmAll, 1);
+  MAHALLE_POINTS.forEach(p => {{
+    const ratio = p.medianPpm ? p.medianPpm / maxPpm : 0.3;
+    const color = `hsl(${{Math.round(130 - ratio * 130)}}, 70%, 45%)`;
+    const radius = 6 + Math.min(p.count, 10) * 1.5;
+    const marker = L.circleMarker([p.lat, p.lon], {{
+      radius, color, fillColor: color, fillOpacity: 0.7, weight: 1,
+    }}).addTo(map);
+    marker.bindPopup(`
+      <b>${{p.name}}</b><br>
+      ${{p.count}} ilan · Medyan m² fiyatı: ${{ppmStr(p.medianPpm)}}<br>
+      <a href="#" onclick="document.getElementById('f-district').value='${{p.district}}'; document.getElementById('f-district').dispatchEvent(new Event('change')); return false;">Bu ilçenin ilanlarını listele</a>
+    `);
+  }});
+}} else {{
+  document.getElementById('map').innerHTML = '<p style="opacity:.6; padding:1rem;">Henüz haritalanabilen mahalle yok.</p>';
+}}
+
+// --- Filtre event listener'ları ---
+document.getElementById('f-search').addEventListener('input', e => {{ state.search = e.target.value; renderList(); }});
+document.getElementById('f-district').addEventListener('change', e => {{ state.district = e.target.value; renderList(); }});
+document.getElementById('f-category').addEventListener('change', e => {{ state.category = e.target.value; renderList(); }});
+document.getElementById('f-owner').addEventListener('change', e => {{ state.owner = e.target.value; renderList(); }});
+document.getElementById('f-sort').addEventListener('change', e => {{ state.sort = e.target.value; renderList(); }});
+document.getElementById('f-clear').addEventListener('click', () => {{
+  state.search = ''; state.district = ''; state.category = ''; state.owner = ''; state.sort = 'score';
+  document.getElementById('f-search').value = '';
+  document.getElementById('f-district').value = '';
+  document.getElementById('f-category').value = '';
+  document.getElementById('f-owner').value = '';
+  document.getElementById('f-sort').value = 'score';
+  renderList();
+}});
+
+renderDistrictTable();
+renderList();
+</script>
 """
     DASHBOARD_PATH.write_text(html, encoding="utf-8")
-    log(f"Dashboard güncellendi: {DASHBOARD_PATH} ({deal_count} fırsat, en yüksek puan {top_scored[0]['investment_score'] if top_scored else '-'})")
+    log(
+        f"Dashboard güncellendi: {DASHBOARD_PATH} ({deal_count} fırsat, en yüksek puan {top_score}, "
+        f"{len(mahalle_points)}/{len(mahalle_groups)} mahalle haritalandı)"
+    )
 
 
 def district_of(listing):
@@ -658,6 +1030,7 @@ def full_report(config, dry_run=False):
                ON CONFLICT(id) DO UPDATE SET last_price = excluded.last_price""",
             (l["id"], l["category"], l["location_slug"], now_str, l["price"]),
         )
+        log_price_history(conn, l["id"], l["price"])
     conn.commit()
 
     use_forum = forum_configured(config)
@@ -694,8 +1067,8 @@ def full_report(config, dry_run=False):
             sent_count += 1
             time.sleep(2.5)
 
+    generate_dashboard(conn, matches)
     conn.close()
-    generate_dashboard(matches)
     log(
         f"Tam rapor: {len(groups)} ilçe, {len(matches)} ilan, {sent_count} mesaj gönderildi, "
         f"{skipped_count} soğuma süresi nedeniyle atlandı."
@@ -750,6 +1123,7 @@ def main():
                             (new_price, listing["id"]),
                         )
                         conn.commit()
+                        log_price_history(conn, listing["id"], new_price)
                         total_price_changes += 1
 
                         if not (first_run and silent_first_run):
@@ -789,6 +1163,7 @@ def main():
                     ),
                 )
                 conn.commit()
+                log_price_history(conn, listing["id"], listing["price"])
                 total_new += 1
                 dashboard_matches.append(listing)
 
@@ -816,8 +1191,8 @@ def main():
 
             time.sleep(config.get("request_delay_seconds", 1.5))
 
+    generate_dashboard(conn, dashboard_matches)
     conn.close()
-    generate_dashboard(dashboard_matches)
     log(
         f"Tarama bitti. {total_checked} ilan kontrol edildi, {total_new} yeni eşleşme, "
         f"{total_price_changes} fiyat değişikliği bulundu."
