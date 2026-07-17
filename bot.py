@@ -630,13 +630,19 @@ def hub4up_post_listing(config, listing):
     meta = {
         "source": "emlakjet",
         "city": district_of(listing),
+        "province": province_of(listing),
         "imageUrl": listing.get("image"),
         "link": listing["url"],
         "price": listing.get("price"),
+        "m2": parse_m2_value(listing),
         "pricePerM2": round(listing["price_per_m2"]) if listing.get("price_per_m2") else None,
+        "medianPricePerM2": round(listing["district_avg_price_per_m2"]) if listing.get("district_avg_price_per_m2") else None,
         "aiScore": listing.get("investment_score"),
+        "aiScoreNotes": listing.get("investment_score_notes") or [],
         "isSahibinden": bool(listing.get("is_sahibinden")),
         "dealNote": listing.get("deal_note"),
+        "datePosted": listing.get("date_posted"),
+        "imar": listing.get("imar") or None,
         "externalId": f"emlakjet:{listing['id']}",
     }
 
