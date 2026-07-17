@@ -1,0 +1,5 @@
+seen.db
+bot.log
+cron.log
+secrets.local.json
+__pycache__/

@@ -1,0 +1,44 @@
+name: KoyEviBot Tarama
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: koyevibot-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: seen.db önbelleğini geri yükle
+        uses: actions/cache@v4
+        with:
+          path: seen.db
+          key: seen-db-${{ github.run_id }}
+          restore-keys: |
+            seen-db-
+
+      - name: Botu çalıştır
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_FORUM_CHAT_ID: ${{ secrets.TELEGRAM_FORUM_CHAT_ID }}
+        run: python3 bot.py
+
+      - name: dashboard.html değiştiyse commit'le
+        run: |
+          git config user.name "KoyEviBot"
+          git config user.email "actions@users.noreply.github.com"
+          git add dashboard.html
+          git diff --cached --quiet || git commit -m "Dashboard güncellendi [skip ci]"
+          git push

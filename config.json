@@ -1,0 +1,35 @@
+{
+  "telegram": {
+    "bot_token": "",
+    "chat_id": "",
+    "forum_chat_id": ""
+  },
+  "max_price": 1000000,
+  "min_price": 50000,
+  "min_size_m2": null,
+  "include_agency_listings": true,
+  "deal_discount_threshold": 0.20,
+  "full_report_cooldown_hours": 12,
+  "silent_first_run": false,
+  "request_delay_seconds": 1.5,
+  "max_pages_per_query": 5,
+  "categories": [
+    "satilik-mustakil-ev",
+    "satilik-koy-evi",
+    "satilik-konut-imarli-arsa"
+  ],
+  "locations": [
+    "izmir-aliaga", "izmir-balcova", "izmir-bayindir", "izmir-bayrakli",
+    "izmir-bergama", "izmir-beydag", "izmir-bornova", "izmir-buca",
+    "izmir-cesme", "izmir-cigli", "izmir-dikili", "izmir-foca",
+    "izmir-gaziemir", "izmir-guzelbahce", "izmir-karabaglar", "izmir-karaburun",
+    "izmir-karsiyaka", "izmir-kemalpasa", "izmir-kinik", "izmir-kiraz",
+    "izmir-konak", "izmir-menderes", "izmir-menemen", "izmir-narlidere",
+    "izmir-odemis", "izmir-seferihisar", "izmir-selcuk", "izmir-tire",
+    "izmir-torbali", "izmir-urla",
+    "manisa-turgutlu", "manisa-saruhanli", "manisa-ahmetli", "manisa-golmarmara",
+    "balikesir-ayvalik", "balikesir-burhaniye", "balikesir-edremit",
+    "balikesir-gomec", "balikesir-havran", "balikesir-sindirgi",
+    "aydin-kusadasi", "aydin-soke", "aydin-germencik", "aydin-incirliova", "aydin-sultanhisar"
+  ]
+}
