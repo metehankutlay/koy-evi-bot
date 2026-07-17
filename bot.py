@@ -584,7 +584,9 @@ def generate_dashboard(matches):
 
     deal_cards = "\n".join(listing_card(l) for l in top_scored) or "<p>Şu an hiç ilan yok.</p>"
 
-    html = f"""<title>KöyEviBot Dashboard</title>
+    html = f"""<!DOCTYPE html>
+<meta charset="UTF-8">
+<title>KöyEviBot Dashboard</title>
 <style>
   :root {{ color-scheme: light dark; }}
   body {{ font-family: -apple-system, system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }}
