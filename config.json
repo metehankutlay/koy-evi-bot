@@ -4,6 +4,13 @@
     "chat_id": "",
     "forum_chat_id": ""
   },
+  "hub4up": {
+    "enabled": true,
+    "url": "https://gxkdruzgytnuvzppnahy.supabase.co",
+    "anon_key": "sb_publishable_-44v3rm6iqONxvNIJn4nFw_lbAywajg",
+    "bot_email": "",
+    "bot_password": ""
+  },
   "max_price": 1000000,
   "min_price": 50000,
   "min_size_m2": null,

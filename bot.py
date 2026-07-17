@@ -17,6 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -65,15 +66,21 @@ def log(msg):
 
 def load_config():
     """config.json (repoda takip edilen, sır içermeyen ayarlar) üzerine, varsa
-    secrets.local.json (yerelde .gitignore'lu, gerçek Telegram bilgileri) ve varsa
-    ortam değişkenleri (GitHub Actions secrets) sırasıyla bindirilir."""
+    secrets.local.json (yerelde .gitignore'lu, gerçek Telegram/hub4up bilgileri) ve
+    varsa ortam değişkenleri (GitHub Actions secrets) sırasıyla bindirilir."""
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         config = json.load(f)
 
     secrets_path = BASE_DIR / "secrets.local.json"
     if secrets_path.exists():
         with open(secrets_path, "r", encoding="utf-8") as f:
-            config.setdefault("telegram", {}).update(json.load(f))
+            local_secrets = json.load(f)
+        if "bot_token" in local_secrets:
+            # Eski format (düz telegram alanları) ile geriye dönük uyumluluk
+            config.setdefault("telegram", {}).update(local_secrets)
+        else:
+            for section, values in local_secrets.items():
+                config.setdefault(section, {}).update(values)
 
     telegram = config.setdefault("telegram", {})
     for key, env_var in [
@@ -83,6 +90,14 @@ def load_config():
     ]:
         if os.environ.get(env_var):
             telegram[key] = os.environ[env_var]
+
+    hub4up = config.setdefault("hub4up", {})
+    for key, env_var in [
+        ("bot_email", "HUB4UP_BOT_EMAIL"),
+        ("bot_password", "HUB4UP_BOT_PASSWORD"),
+    ]:
+        if os.environ.get(env_var):
+            hub4up[key] = os.environ[env_var]
 
     return config
 
@@ -123,6 +138,10 @@ def init_db():
         pass  # kolon zaten var
     try:
         conn.execute("ALTER TABLE seen ADD COLUMN last_notified TEXT")
+    except sqlite3.OperationalError:
+        pass  # kolon zaten var
+    try:
+        conn.execute("ALTER TABLE seen ADD COLUMN hub4up_posted INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
         pass  # kolon zaten var
     conn.commit()
@@ -216,6 +235,7 @@ def normalize(item):
         for p in item.get("additionalProperty", [])
         if isinstance(p, dict)
     }
+    images = item.get("image") or []
     return {
         "id": listing_id,
         "name": item.get("name", "").strip(),
@@ -227,6 +247,7 @@ def normalize(item):
         "tag": props.get("İlan Etiketi", ""),
         "imar": props.get("İmar Durumu", ""),
         "date_posted": item.get("datePosted", ""),
+        "image": images[0] if images else None,
     }
 
 
@@ -545,6 +566,110 @@ def get_topic_thread_id(conn, config, district, dry_run=False):
         except Exception as e:
             log(f"Topic oluşturma hatası ({district}): {e}")
             return None
+
+
+HUB4UP_CATEGORY_MAP = {
+    "satilik-mustakil-ev": "ev",
+    "satilik-koy-evi": "ev",
+    "satilik-konut-imarli-arsa": "arsa",
+}
+
+HUB4UP_META_SEP = "\n\n###İLANMETA###\n\n"
+
+_hub4up_session = {"access_token": None, "uid": None}
+
+
+def hub4up_configured(config):
+    h = config.get("hub4up", {})
+    return bool(h.get("enabled") and h.get("bot_email") and h.get("bot_password"))
+
+
+def hub4up_login(config):
+    """hub4up bot hesabıyla giriş yapar, access_token+uid'i bu process içinde önbelleğe
+    alır (aynı çalıştırmada tekrar tekrar login olmaya gerek kalmaz)."""
+    if _hub4up_session["access_token"]:
+        return _hub4up_session["access_token"], _hub4up_session["uid"]
+
+    h = config["hub4up"]
+    url = h["url"].rstrip("/") + "/auth/v1/token?grant_type=password"
+    payload = json.dumps(
+        {"email": h["bot_email"], "password": h["bot_password"]}
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"apikey": h["anon_key"], "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read())
+
+    _hub4up_session["access_token"] = data["access_token"]
+    _hub4up_session["uid"] = data["user"]["id"]
+    return _hub4up_session["access_token"], _hub4up_session["uid"]
+
+
+def hub4up_pack_meta(desc, meta):
+    return desc + HUB4UP_META_SEP + json.dumps(meta, ensure_ascii=False)
+
+
+def hub4up_post_listing(config, listing):
+    """Bir ilanı hub4up'ın İlanlar (posts, type='listing') tablosuna ekler. Bot kendi
+    hesabıyla (anon key + normal RLS, service role YOK) giriş yapıp normal bir
+    kullanıcının 'İlan Ekle' akışıyla aynı şekilde INSERT atar."""
+    h = config["hub4up"]
+    access_token, uid = hub4up_login(config)
+
+    category = HUB4UP_CATEGORY_MAP.get(listing["category"], "diger_firsat")
+    desc_parts = []
+    if listing.get("m2"):
+        desc_parts.append(listing["m2"])
+    if listing.get("imar"):
+        desc_parts.append(f"İmar: {listing['imar']}")
+    desc = " · ".join(desc_parts)
+
+    meta = {
+        "source": "emlakjet",
+        "city": district_of(listing),
+        "imageUrl": listing.get("image"),
+        "link": listing["url"],
+        "price": listing.get("price"),
+        "pricePerM2": round(listing["price_per_m2"]) if listing.get("price_per_m2") else None,
+        "aiScore": listing.get("investment_score"),
+        "isSahibinden": bool(listing.get("is_sahibinden")),
+        "dealNote": listing.get("deal_note"),
+        "externalId": f"emlakjet:{listing['id']}",
+    }
+
+    tags = [district_of(listing), province_of(listing)]
+    if listing.get("is_sahibinden"):
+        tags.append("sahibinden")
+
+    body = hub4up_pack_meta(desc, meta)
+    insert_payload = {
+        "id": str(uuid.uuid4()),
+        "author_id": uid,
+        "type": "listing",
+        "title": listing["name"],
+        "body": body,
+        "url": listing["url"],
+        "category": category,
+        "tags": tags,
+        "image_url": None,
+    }
+
+    req = urllib.request.Request(
+        h["url"].rstrip("/") + "/rest/v1/posts",
+        data=json.dumps(insert_payload).encode("utf-8"),
+        headers={
+            "apikey": h["anon_key"],
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read()
 
 
 def fetch_category_listings(config, category, location):
@@ -1188,6 +1313,18 @@ def main():
                 )
                 conn.commit()
                 time.sleep(1)  # Telegram flood limitine takılmamak için
+
+                if hub4up_configured(config) and not dry_run:
+                    try:
+                        hub4up_post_listing(config, listing)
+                        conn.execute(
+                            "UPDATE seen SET hub4up_posted = 1 WHERE id = ?",
+                            (listing["id"],),
+                        )
+                        conn.commit()
+                    except Exception as e:
+                        log(f"hub4up gönderim hatası ({listing['id']}): {e}")
+                    time.sleep(0.5)
 
             time.sleep(config.get("request_delay_seconds", 1.5))
 
