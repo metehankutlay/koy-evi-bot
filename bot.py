@@ -23,6 +23,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 DB_PATH = BASE_DIR / "seen.db"
+TOPICS_PATH = BASE_DIR / "topics.json"
 LOG_PATH = BASE_DIR / "bot.log"
 
 USER_AGENT = (
@@ -145,7 +146,30 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # kolon zaten var
     conn.commit()
+    # topics.json repo'da varsa DB'ye upsert et — cache kaybolsa bile thread_id'ler korunur
+    if TOPICS_PATH.exists():
+        try:
+            with open(TOPICS_PATH, "r", encoding="utf-8") as f:
+                saved_topics = json.load(f)
+            for district, thread_id in saved_topics.items():
+                conn.execute(
+                    "INSERT OR IGNORE INTO topics (district, thread_id) VALUES (?, ?)",
+                    (district, thread_id),
+                )
+            conn.commit()
+        except Exception as e:
+            log(f"topics.json yüklenemedi: {e}")
     return conn
+
+
+def _save_topics_json(conn):
+    """topics tablosundaki tüm kayıtları topics.json'a yaz."""
+    try:
+        rows = conn.execute("SELECT district, thread_id FROM topics").fetchall()
+        with open(TOPICS_PATH, "w", encoding="utf-8") as f:
+            json.dump({r[0]: r[1] for r in rows}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log(f"topics.json yazılamadı: {e}")
 
 
 def log_price_history(conn, listing_id, price):
@@ -551,6 +575,7 @@ def get_topic_thread_id(conn, config, district, dry_run=False):
                 (district, thread_id),
             )
             conn.commit()
+            _save_topics_json(conn)
             return thread_id
         except urllib.error.HTTPError as e:
             if e.code == 429 and attempt == 0:
