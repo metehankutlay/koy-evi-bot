@@ -1360,6 +1360,7 @@ def main():
             time.sleep(config.get("request_delay_seconds", 1.5))
 
     generate_dashboard(conn, dashboard_matches)
+    _save_topics_json(conn)
     conn.close()
     log(
         f"Tarama bitti. {total_checked} ilan kontrol edildi, {total_new} yeni eşleşme, "

@@ -39,6 +39,7 @@ jobs:
         run: |
           git config user.name "KoyEviBot"
           git config user.email "actions@users.noreply.github.com"
-          git add dashboard.html topics.json
+          git add dashboard.html
+          test -f topics.json && git add topics.json || true
           git diff --cached --quiet || git commit -m "Dashboard + topic ID'leri güncellendi [skip ci]"
           git push
