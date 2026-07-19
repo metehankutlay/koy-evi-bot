@@ -153,7 +153,7 @@ def init_db():
                 saved_topics = json.load(f)
             for district, thread_id in saved_topics.items():
                 conn.execute(
-                    "INSERT OR IGNORE INTO topics (district, thread_id) VALUES (?, ?)",
+                    "INSERT OR REPLACE INTO topics (district, thread_id) VALUES (?, ?)",
                     (district, thread_id),
                 )
             conn.commit()
