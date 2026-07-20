@@ -55,7 +55,7 @@ DISTRICT_NAMES = {
     "balikesir-edremit": "Edremit",
     "balikesir-gomec": "Gömeç",
     "balikesir-havran": "Havran",
-    "balikesir-sindirgi": "Sindirgi",
+    "balikesir-sindirgi": "Sındırgı",
     "aydin-kusadasi": "Kuşadası",
     "aydin-soke": "Söke",
     "aydin-germencik": "Germencik",
