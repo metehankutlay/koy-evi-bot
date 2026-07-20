@@ -3,7 +3,12 @@ name: KoyEviBot Tarama
 on:
   schedule:
     - cron: "*/30 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      delete_seen_ids:
+        description: "seen.db'den silinecek ilan ID'leri (virgülle ayrılmış, örn: 19623087,19623088)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -27,6 +32,27 @@ jobs:
           key: seen-db-${{ github.run_id }}
           restore-keys: |
             seen-db-
+
+      - name: Belirtilen ilanları seen.db'den sil
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.delete_seen_ids != '' }}
+        run: |
+          python3 - <<'EOF'
+          import sqlite3, os
+          ids = os.environ["DELETE_IDS"].split(",")
+          if not os.path.exists("seen.db"):
+              print("seen.db yok, atlanıyor.")
+          else:
+              conn = sqlite3.connect("seen.db")
+              for raw in ids:
+                  lid = raw.strip()
+                  if lid:
+                      conn.execute("DELETE FROM seen WHERE id = ?", (lid,))
+                      print(f"Silindi (seen): {lid}")
+              conn.commit()
+              conn.close()
+          EOF
+        env:
+          DELETE_IDS: ${{ inputs.delete_seen_ids }}
 
       - name: Botu çalıştır
         env:
