@@ -49,6 +49,57 @@ PROVINCE_LABELS = {
     "aydin": "Aydın",
 }
 
+# Slug → Türkçe ilçe adı sabit mapping'i.
+# district_of() bu mapping'i kullanır; böylece emlakjet'in location alanı
+# farklı format verse bile ilçe adı tutarlı kalır ve Telegram topic'leriyle eşleşir.
+DISTRICT_NAMES = {
+    "izmir-aliaga": "Aliağa",
+    "izmir-balcova": "Balçova",
+    "izmir-bayindir": "Bayındır",
+    "izmir-bayrakli": "Bayraklı",
+    "izmir-bergama": "Bergama",
+    "izmir-beydag": "Beydağ",
+    "izmir-bornova": "Bornova",
+    "izmir-buca": "Buca",
+    "izmir-cesme": "Çeşme",
+    "izmir-cigli": "Çiğli",
+    "izmir-dikili": "Dikili",
+    "izmir-foca": "Foça",
+    "izmir-gaziemir": "Gaziemir",
+    "izmir-guzelbahce": "Güzelbahçe",
+    "izmir-karabaglar": "Karabağlar",
+    "izmir-karaburun": "Karaburun",
+    "izmir-karsiyaka": "Karşıyaka",
+    "izmir-kemalpasa": "Kemalpaşa",
+    "izmir-kinik": "Kınık",
+    "izmir-kiraz": "Kiraz",
+    "izmir-konak": "Konak",
+    "izmir-menderes": "Menderes",
+    "izmir-menemen": "Menemen",
+    "izmir-narlidere": "Narlıdere",
+    "izmir-odemis": "Ödemiş",
+    "izmir-seferihisar": "Seferihisar",
+    "izmir-selcuk": "Selçuk",
+    "izmir-tire": "Tire",
+    "izmir-torbali": "Torbalı",
+    "izmir-urla": "Urla",
+    "manisa-turgutlu": "Turgutlu",
+    "manisa-saruhanli": "Saruhanlı",
+    "manisa-ahmetli": "Ahmetli",
+    "manisa-golmarmara": "Gölmarmara",
+    "balikesir-ayvalik": "Ayvalık",
+    "balikesir-burhaniye": "Burhaniye",
+    "balikesir-edremit": "Edremit",
+    "balikesir-gomec": "Gömeç",
+    "balikesir-havran": "Havran",
+    "balikesir-sindirgi": "Sindirgi",
+    "aydin-kusadasi": "Kuşadası",
+    "aydin-soke": "Söke",
+    "aydin-germencik": "Germencik",
+    "aydin-incirliova": "İncirliova",
+    "aydin-sultanhisar": "Sultanhisar",
+}
+
 
 def province_of(listing):
     slug = listing.get("location_slug", "")
@@ -1152,10 +1203,14 @@ renderList();
 
 
 def district_of(listing):
+    slug = listing.get("location_slug", "")
+    if slug in DISTRICT_NAMES:
+        return DISTRICT_NAMES[slug]
+    # Fallback: config'de tanımlı olmayan slug'lar için location alanını parse et
     loc = listing.get("location") or ""
     if "," in loc:
         return loc.split(",")[-1].strip()
-    return listing.get("location_slug", "Bilinmeyen")
+    return slug or "Bilinmeyen"
 
 
 def full_report(config, dry_run=False):
