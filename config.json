@@ -17,7 +17,7 @@
   "include_agency_listings": true,
   "deal_discount_threshold": 0.20,
   "full_report_cooldown_hours": 12,
-  "silent_first_run": false,
+  "silent_first_run": true,
   "request_delay_seconds": 1.5,
   "max_pages_per_query": 5,
   "categories": [

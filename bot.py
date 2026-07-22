@@ -24,6 +24,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 DB_PATH = BASE_DIR / "seen.db"
 TOPICS_PATH = BASE_DIR / "topics.json"
+SEEN_IDS_PATH = BASE_DIR / "seen_ids.json"
 LOG_PATH = BASE_DIR / "bot.log"
 
 USER_AGENT = (
@@ -218,6 +219,24 @@ def init_db():
             conn.commit()
         except Exception as e:
             log(f"topics.json yüklenemedi: {e}")
+
+    # seen_ids.json repo'da varsa DB'ye yükle — Actions cache'i kaybolsa bile
+    # görülmüş ilanlar korunur, "ilk çalıştırma" flood'u yaşanmaz. Git kalıcı
+    # kaynak, cache sadece hızlandırma. INSERT OR IGNORE: cache'te zaten daha
+    # zengin veri varsa (kategori/lokasyon/last_notified) üzerine yazma.
+    if SEEN_IDS_PATH.exists():
+        try:
+            with open(SEEN_IDS_PATH, "r", encoding="utf-8") as f:
+                saved_seen = json.load(f)
+            for listing_id, last_price in saved_seen.items():
+                conn.execute(
+                    "INSERT OR IGNORE INTO seen (id, category, location, first_seen, last_price) "
+                    "VALUES (?, '', '', '', ?)",
+                    (listing_id, last_price),
+                )
+            conn.commit()
+        except Exception as e:
+            log(f"seen_ids.json yüklenemedi: {e}")
     return conn
 
 
@@ -229,6 +248,18 @@ def _save_topics_json(conn):
             json.dump({r[0]: r[1] for r in rows}, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log(f"topics.json yazılamadı: {e}")
+
+
+def _save_seen_ids(conn):
+    """seen tablosundaki ilan ID'lerini + son fiyatlarını seen_ids.json'a yaz.
+    Workflow bunu commit eder; böylece cache kaybolsa bile görülmüş ilanlar
+    git'ten geri yüklenir ve tekrar bildirim gönderilmez."""
+    try:
+        rows = conn.execute("SELECT id, last_price FROM seen ORDER BY id").fetchall()
+        with open(SEEN_IDS_PATH, "w", encoding="utf-8") as f:
+            json.dump({r[0]: r[1] for r in rows}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log(f"seen_ids.json yazılamadı: {e}")
 
 
 def log_price_history(conn, listing_id, price):
@@ -1287,6 +1318,8 @@ def full_report(config, dry_run=False):
             time.sleep(2.5)
 
     generate_dashboard(conn, matches)
+    _save_topics_json(conn)
+    _save_seen_ids(conn)
     conn.close()
     log(
         f"Tam rapor: {len(groups)} ilçe, {len(matches)} ilan, {sent_count} mesaj gönderildi, "
@@ -1424,6 +1457,7 @@ def main():
 
     generate_dashboard(conn, dashboard_matches)
     _save_topics_json(conn)
+    _save_seen_ids(conn)
     conn.close()
     log(
         f"Tarama bitti. {total_checked} ilan kontrol edildi, {total_new} yeni eşleşme, "

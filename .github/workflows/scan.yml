@@ -67,5 +67,6 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           git add dashboard.html
           test -f topics.json && git add topics.json || true
-          git diff --cached --quiet || git commit -m "Dashboard + topic ID'leri güncellendi [skip ci]"
+          test -f seen_ids.json && git add seen_ids.json || true
+          git diff --cached --quiet || git commit -m "Dashboard + topic + seen ID'leri güncellendi [skip ci]"
           git push
