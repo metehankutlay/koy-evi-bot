@@ -208,6 +208,13 @@ def init_db():
                     "INSERT OR REPLACE INTO topics (district, thread_id) VALUES (?, ?)",
                     (district, thread_id),
                 )
+            # topics.json dışında kalan eski/silinmiş girişleri temizle
+            if saved_topics:
+                placeholders = ",".join("?" * len(saved_topics))
+                conn.execute(
+                    f"DELETE FROM topics WHERE district NOT IN ({placeholders})",
+                    list(saved_topics.keys()),
+                )
             conn.commit()
         except Exception as e:
             log(f"topics.json yüklenemedi: {e}")
