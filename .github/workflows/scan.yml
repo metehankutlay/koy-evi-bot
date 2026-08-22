@@ -24,6 +24,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
 
       - name: seen.db önbelleğini geri yükle
         uses: actions/cache@v4
@@ -68,5 +70,23 @@ jobs:
           git add dashboard.html
           test -f topics.json && git add topics.json || true
           test -f seen_ids.json && git add seen_ids.json || true
-          git diff --cached --quiet || git commit -m "Dashboard + topic + seen ID'leri güncellendi [skip ci]"
-          git push
+          # Değişiklik yoksa çık
+          if git diff --cached --quiet; then
+            echo "Değişiklik yok, commit atlanıyor."
+            exit 0
+          fi
+          git commit -m "Dashboard + topic + seen ID'leri güncellendi [skip ci]"
+          # Remote sapmışsa (manuel push / başka çalışma) rebase edip tekrar dene —
+          # düz 'git push' fetch-first ile fail veriyordu; artık dayanıklı.
+          for attempt in 1 2 3 4 5; do
+            if git push origin HEAD:main; then
+              echo "Push başarılı (deneme $attempt)."
+              exit 0
+            fi
+            echo "Push reddedildi (deneme $attempt), remote ile rebase ediliyor..."
+            git fetch origin main
+            git rebase origin/main || { git rebase --abort; sleep 3; continue; }
+            sleep 2
+          done
+          echo "::error::Push 5 denemede başarısız oldu."
+          exit 1
