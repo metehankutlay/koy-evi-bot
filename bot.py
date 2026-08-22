@@ -41,6 +41,10 @@ CATEGORY_LABELS = {
     "satilik-mustakil-ev": "Müstakil Ev",
     "satilik-koy-evi": "Köy Evi",
     "satilik-konut-imarli-arsa": "İmarlı Arsa",
+    "satilik-arsa": "Arsa",
+    "satilik-tarla": "Tarla",
+    "satilik-bag-bahce": "Bağ / Bahçe",
+    "satilik-zeytinlik": "Zeytinlik",
 }
 
 PROVINCE_LABELS = {
@@ -424,6 +428,28 @@ def passes_filters(listing, config):
         if m2 and m2 < min_size:
             return False
 
+    return True
+
+
+def passes_land_filters(listing, config):
+    """Arsa/tarla/bağ-bahçe/zeytinlik grubu için filtre. Ev grubundan tamamen
+    ayrı eşikler: min alan (varsayılan 500 m²) ve fiyat aralığı. Alan bilgisi
+    parse edilemiyorsa '≥ min m²' koşulu doğrulanamayacağı için ilan alınmaz."""
+    max_price = config.get("land_max_price", 900000)
+    min_price = config.get("land_min_price", 50000)
+    min_size = config.get("land_min_size_m2", 500)
+
+    price = listing.get("price")
+    if price is None:
+        return False
+    if max_price and price > max_price:
+        return False
+    if min_price and price < min_price:
+        return False
+
+    m2 = parse_m2_value(listing)
+    if m2 is None or m2 < min_size:
+        return False
     return True
 
 
@@ -1327,6 +1353,148 @@ def full_report(config, dry_run=False):
     )
 
 
+def run_land_scan(
+    conn,
+    config,
+    first_run,
+    silent_first_run,
+    use_forum,
+    forum_chat_id,
+    dry_run,
+    dashboard_matches,
+):
+    """Arsa / tarla / bağ-bahçe / zeytinlik taraması. Ev döngüsünden TAMAMEN
+    bağımsızdır: eşleşmeleri ayrı 'İlçe-Arsa/Tarla' forum topic'lerine gönderir,
+    mevcut ev topic'lerine asla dokunmaz. Yalnızca Telegram'a gönderir (hub4up'a
+    göndermez). Ev döngüsüyle aynı seen.db tablosunu kullanır — ilan ID'leri farklı
+    olduğu için çakışma olmaz, aynı flood-koruması (git'e yazılan seen_ids.json +
+    silent_first_run) burada da geçerlidir.
+
+    İlk kez tarandığında birikmiş tüm arazi ilanları 'yeni' sayılacağı için, tek
+    çalışmada gönderilecek yeni ilan sayısı land_max_new_per_run ile sınırlanır;
+    kalanlar sonraki çalışmalarda kademeli gönderilir (Telegram flood/işlem timeout
+    riskini önler). Steady-state'te (birkaç yeni ilan) bu sınıra takılınmaz."""
+    land_categories = config.get("land_categories", [])
+    if not land_categories:
+        return 0, 0
+
+    suffix = config.get("land_topic_suffix", "-Arsa/Tarla")
+    max_new = config.get("land_max_new_per_run", 60)
+    now_fn = lambda: time.strftime("%Y-%m-%d %H:%M:%S")
+
+    new_sent = 0
+    checked = 0
+    price_changes = 0
+
+    for location in config["locations"]:
+        for category in land_categories:
+            try:
+                matches = fetch_category_listings(config, category, location)
+            except Exception as e:
+                log(f"HATA (arazi): {category}/{location} -> {e}")
+                continue
+
+            checked += len(matches)
+
+            for listing in matches:
+                row = conn.execute(
+                    "SELECT last_price FROM seen WHERE id = ?", (listing["id"],)
+                ).fetchone()
+
+                if row:
+                    # Görülmüş ilan — fiyat değişimi kontrolü (ev döngüsüyle aynı mantık)
+                    old_price = row[0]
+                    new_price = listing["price"]
+                    if (
+                        new_price is not None
+                        and old_price is not None
+                        and new_price != old_price
+                    ):
+                        conn.execute(
+                            "UPDATE seen SET last_price = ? WHERE id = ?",
+                            (new_price, listing["id"]),
+                        )
+                        conn.commit()
+                        log_price_history(conn, listing["id"], new_price)
+                        price_changes += 1
+
+                        if not (first_run and silent_first_run):
+                            thread_id = None
+                            if use_forum:
+                                thread_id = get_topic_thread_id(
+                                    conn, config, district_of(listing) + suffix, dry_run=dry_run
+                                )
+                            send_telegram(
+                                config,
+                                format_price_change_message(listing, old_price, new_price),
+                                dry_run=dry_run,
+                                chat_id=forum_chat_id if use_forum else None,
+                                thread_id=thread_id,
+                            )
+                            conn.execute(
+                                "UPDATE seen SET last_notified = ? WHERE id = ?",
+                                (now_fn(), listing["id"]),
+                            )
+                            conn.commit()
+                            time.sleep(1)
+                    if passes_land_filters(listing, config):
+                        dashboard_matches.append(listing)
+                    continue
+
+                if not passes_land_filters(listing, config):
+                    continue
+
+                conn.execute(
+                    "INSERT INTO seen (id, category, location, first_seen, last_price) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        listing["id"],
+                        category,
+                        location,
+                        now_fn(),
+                        listing["price"],
+                    ),
+                )
+                conn.commit()
+                log_price_history(conn, listing["id"], listing["price"])
+                dashboard_matches.append(listing)
+
+                if first_run and silent_first_run:
+                    continue
+
+                thread_id = None
+                if use_forum:
+                    thread_id = get_topic_thread_id(
+                        conn, config, district_of(listing) + suffix, dry_run=dry_run
+                    )
+                send_telegram(
+                    config,
+                    format_message(listing),
+                    dry_run=dry_run,
+                    chat_id=forum_chat_id if use_forum else None,
+                    thread_id=thread_id,
+                )
+                conn.execute(
+                    "UPDATE seen SET last_notified = ? WHERE id = ?",
+                    (now_fn(), listing["id"]),
+                )
+                conn.commit()
+                new_sent += 1
+                time.sleep(1)  # Telegram flood limitine takılmamak için
+
+                if new_sent >= max_new:
+                    log(
+                        f"Arazi taraması: bu çalışmada {max_new} yeni ilan sınırına ulaşıldı; "
+                        "kalan birikmiş ilanlar sonraki çalışmalarda kademeli gönderilecek."
+                    )
+                    return new_sent, checked
+
+    log(
+        f"Arazi taraması bitti. {checked} ilan kontrol edildi, {new_sent} yeni gönderildi, "
+        f"{price_changes} fiyat değişikliği."
+    )
+    return new_sent, checked
+
+
 def main():
     dry_run = "--dry-run" in sys.argv
     config = load_config()
@@ -1455,13 +1623,27 @@ def main():
 
             time.sleep(config.get("request_delay_seconds", 1.5))
 
+    # --- Arazi (arsa/tarla/bağ-bahçe/zeytinlik) geçişi: ev döngüsünden bağımsız,
+    #     ayrı 'İlçe-Arsa/Tarla' topic'lerine gönderir. ---
+    land_new, land_checked = run_land_scan(
+        conn,
+        config,
+        first_run,
+        silent_first_run,
+        use_forum,
+        forum_chat_id,
+        dry_run,
+        dashboard_matches,
+    )
+
     generate_dashboard(conn, dashboard_matches)
     _save_topics_json(conn)
     _save_seen_ids(conn)
     conn.close()
     log(
-        f"Tarama bitti. {total_checked} ilan kontrol edildi, {total_new} yeni eşleşme, "
-        f"{total_price_changes} fiyat değişikliği bulundu."
+        f"Tarama bitti. Ev: {total_checked} kontrol / {total_new} yeni / "
+        f"{total_price_changes} fiyat değişikliği. "
+        f"Arazi: {land_checked} kontrol / {land_new} yeni."
         + (" (ilk çalıştırma, DB dolduruldu)" if first_run else "")
     )
 

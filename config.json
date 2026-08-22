@@ -22,9 +22,19 @@
   "max_pages_per_query": 5,
   "categories": [
     "satilik-mustakil-ev",
-    "satilik-koy-evi",
-    "satilik-konut-imarli-arsa"
+    "satilik-koy-evi"
   ],
+  "land_categories": [
+    "satilik-arsa",
+    "satilik-tarla",
+    "satilik-bag-bahce",
+    "satilik-zeytinlik"
+  ],
+  "land_min_size_m2": 500,
+  "land_max_price": 900000,
+  "land_min_price": 50000,
+  "land_topic_suffix": "-Arsa/Tarla",
+  "land_max_new_per_run": 60,
   "locations": [
     "izmir-aliaga", "izmir-balcova", "izmir-bayindir", "izmir-bayrakli",
     "izmir-bergama", "izmir-beydag", "izmir-bornova", "izmir-buca",
